@@ -20,8 +20,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Match the MCU: mode 0, eight-bit words, MSB first.
-    uint8_t mode = SPI_MODE_0;
+    // Match the MCU: mode 1, eight-bit words, MSB first.
+    uint8_t mode = SPI_MODE_1;
     uint8_t bits = 8;
     uint8_t lsb_first = 0;
     uint32_t clock_hz = 100000;
