@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
     uint8_t mode = SPI_MODE_1;
     uint8_t bits = 8;
     uint8_t lsb_first = 0;
-    uint32_t clock_hz = 100000;
+    uint32_t clock_hz = 10000;
 
     if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
         ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
@@ -39,10 +39,10 @@ int main(int argc, char** argv) {
     // These are simulated requests, not motor/servo outputs.
     const char* commands[] = {
         "0,0,0",       // Stationary.
-        "100,0,0",     // Forward request.
-        "100,150,0",   // Right steering request.
-        "100,-150,0",  // Left steering request.
-        "0,0,1",       // Brake request.
+        // "100,0,0",     // Forward request.
+        // "100,150,0",   // Right steering request.
+        // "100,-150,0",  // Left steering request.
+        "0,0,0",       // Brake request.
         "0,0,0"        // Stationary, brake released.
     };
 
