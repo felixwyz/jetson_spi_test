@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
         // Hold each test command for approximately one second.
         if (++repetitions == 20) {
             repetitions = 0;
-            step = (step + 1) % 6;
+            step = (step + 1) % 3;
         }
 
         // Approximately 20 transmissions per second.
