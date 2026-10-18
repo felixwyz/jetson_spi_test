@@ -39,9 +39,9 @@ int main(int argc, char** argv) {
     // These are simulated requests, not motor/servo outputs.
     const char* commands[] = {
         "0,0,0",       // Stationary.
-        // "100,0,0",     // Forward request.
-        // "100,150,0",   // Right steering request.
-        // "100,-150,0",  // Left steering request.
+        "100,0,0",     // Forward request.
+        "100,150,0",   // Right steering request.
+        "100,-150,0",  // Left steering request.
         "0,0,0",       // Brake request.
         "0,0,0"        // Stationary, brake released.
     };
@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
         // Hold each test command for approximately one second.
         if (++repetitions == 20) {
             repetitions = 0;
-            step = (step + 1) % 3;
+            step = (step + 1) % 6;
         }
 
         // Approximately 20 transmissions per second.
