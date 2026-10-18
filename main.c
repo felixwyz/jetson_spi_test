@@ -64,7 +64,7 @@ int main(void) {
         spi1,
         8,
         SPI_CPOL_0,
-        SPI_CPHA_0,
+        SPI_CPHA_1,
         SPI_MSB_FIRST
     );
 
