@@ -1,3 +1,4 @@
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdint>
@@ -11,7 +12,7 @@
 #include "spi_protocol.h"
 
 // Standalone Stage 1 mock commands.
-// The MCU Stage 1 receiver keeps motors and servo disabled.
+// The MCU receiver keeps motors and servo disabled.
 struct TestCommand {
     int16_t speed;
     int16_t steer;
@@ -19,15 +20,15 @@ struct TestCommand {
 };
 
 static constexpr TestCommand commands[] = {
-    {0,   0,    0}, // Stationary.
-    {100, 0,    0}, // Forward request.
-    {100, 150,  0}, // Right steering request.
-    {100, -150, 0}, // Left steering request.
-    {0,   0,    1}, // Emergency brake request.
-    {0,   0,    0}  // Brake released.
+    {0,   0,    0}, // Stationary
+    {100, 0,    0}, // Forward
+    {100, 150,  0}, // Right steering
+    {100, -150, 0}, // Left steering
+    {0,   0,    1}, // Emergency brake
+    {0,   0,    0}  // Brake released
 };
 
-// Advance an absolute deadline by one command period.
+// Advance absolute deadline by one command period.
 static void add_period(struct timespec *t) {
     t->tv_nsec += (long)SPI_CMD_PERIOD_US * 1000L;
 
@@ -37,7 +38,6 @@ static void add_period(struct timespec *t) {
     }
 }
 
-// Return true when timestamp a is later than timestamp b.
 static bool time_is_later(
     const struct timespec &a,
     const struct timespec &b
@@ -46,7 +46,7 @@ static bool time_is_later(
            (a.tv_sec == b.tv_sec && a.tv_nsec > b.tv_nsec);
 }
 
-// Print the encoded command bytes for comparison with MCU reception.
+// Print encoded bytes for debugging.
 static void dump_hex(const uint8_t *data) {
     for (unsigned i = 0; i < SPI_CMD_BYTES; ++i) {
         std::printf(" %02X", (unsigned)data[i]);
@@ -59,18 +59,20 @@ int main(int argc, char **argv) {
     if (argc != 2) {
         std::fprintf(
             stderr,
-            "Usage: %s /dev/spidevB.C  OR  %s --dry-run\n",
+            "Usage: %s /dev/spidevB.C OR %s --dry-run\n",
             argv[0],
             argv[0]
         );
         return 1;
     }
 
-    const bool dry_run = std::strcmp(argv[1], "--dry-run") == 0;
+    const bool dry_run =
+        std::strcmp(argv[1], "--dry-run") == 0;
+
     int fd = -1;
 
     if (!dry_run) {
-        // Open the SPI device configured on the Jetson.
+        // Open Jetson SPI device.
         fd = open(argv[1], O_RDWR);
 
         if (fd < 0) {
@@ -78,8 +80,9 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        // Match the MCU: mode 0, eight-bit words, MSB first.
-        uint8_t mode = SPI_MODE_0;
+        // SPI Mode 1: CPOL=0, CPHA=1.
+        // Match MCU settings.
+        uint8_t mode = SPI_MODE_1;
         uint8_t bits = 8;
         uint8_t lsb_first = 0;
         uint32_t speed = SPI_CMD_CLOCK_HZ;
@@ -88,6 +91,7 @@ int main(int argc, char **argv) {
             ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
             ioctl(fd, SPI_IOC_WR_LSB_FIRST, &lsb_first) < 0 ||
             ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+
             std::perror("SPI setup");
             close(fd);
             return 1;
@@ -97,7 +101,7 @@ int main(int argc, char **argv) {
     std::puts(
         dry_run
             ? "[DRY RUN] generating binary packets only"
-            : "[TX READY] SPI mode 0, 100 kHz SCK, 10 bytes @ 50 Hz"
+            : "[TX READY] SPI mode 1, 100 kHz SCK, 10 bytes @ 50 Hz"
     );
 
     uint16_t sequence = 0;
@@ -105,7 +109,7 @@ int main(int argc, char **argv) {
     unsigned repeats = 0;
     unsigned sent_count = 0;
 
-    // Generate all six mock steps, then exit in dry-run mode.
+    // Six commands, 50 packets each.
     const unsigned max_dry_packets = 300;
 
     struct timespec next;
@@ -120,38 +124,38 @@ int main(int argc, char **argv) {
         cmd.target_steering_mrad = v.steer;
         cmd.emergency_brake = v.brake;
 
-        // Encode the shared ten-byte layout, including its CRC.
+        // Encode fixed 10-byte binary packet.
         uint8_t tx[SPI_CMD_BYTES];
         spi_command_encode(&cmd, tx);
 
         if (!dry_run) {
-            // Received bytes are discarded; Stage 1 has no acknowledgement.
+            // SPI is full duplex, but MCU replies are
+            // not required for Stage 1.
             uint8_t unused_rx[SPI_CMD_BYTES] = {};
 
-            // Mode 0: request a CS pulse between each eight-bit word.
-            // All ten bytes still form one command.
-            spi_ioc_transfer transfers[SPI_CMD_BYTES] = {};
+            // SPI MODE 1:
+            // One continuous 10-byte transfer.
+            // CS stays asserted during the packet.
+            spi_ioc_transfer transfer = {};
 
-            for (unsigned i = 0; i < SPI_CMD_BYTES; ++i) {
-                transfers[i].tx_buf = (uint64_t)(uintptr_t)&tx[i];
-                transfers[i].rx_buf = (uint64_t)(uintptr_t)&unused_rx[i];
-                transfers[i].len = 1;
-                transfers[i].speed_hz = SPI_CMD_CLOCK_HZ;
-                transfers[i].bits_per_word = 8;
+            transfer.tx_buf =
+                (uint64_t)(uintptr_t)tx;
 
-                // Pulse CS after the first nine bytes.
-                // The final transfer ends the message with CS deasserted.
-                transfers[i].cs_change = (i + 1u < SPI_CMD_BYTES);
-            }
+            transfer.rx_buf =
+                (uint64_t)(uintptr_t)unused_rx;
 
-            // Submit all ten byte transfers in one system call.
+            transfer.len = SPI_CMD_BYTES;
+            transfer.speed_hz = SPI_CMD_CLOCK_HZ;
+            transfer.bits_per_word = 8;
+            transfer.cs_change = 0;
+
+            // Send all 10 bytes in one SPI transaction.
             const int n = ioctl(
                 fd,
-                SPI_IOC_MESSAGE(SPI_CMD_BYTES),
-                transfers
+                SPI_IOC_MESSAGE(1),
+                &transfer
             );
 
-            // A successful message transfers ten bytes in total.
             if (n != (int)SPI_CMD_BYTES) {
                 std::fprintf(
                     stderr,
@@ -160,12 +164,13 @@ int main(int argc, char **argv) {
                     errno,
                     std::strerror(errno)
                 );
+
                 close(fd);
                 return 1;
             }
         }
 
-        // Print representative commands instead of every frame.
+        // Print representative packets.
         if (repeats == 0 || (sequence % 50u) == 0u) {
             std::printf(
                 "[TX] seq=%u speed_mm_s=%d steer_mrad=%d "
@@ -181,11 +186,10 @@ int main(int argc, char **argv) {
             std::fflush(stdout);
         }
 
-        // uint16_t wraps automatically after 65535.
         ++sequence;
         ++sent_count;
 
-        // Hold each mock command for 50 packets: nominally one second.
+        // Hold each command for 50 packets (~1 second).
         if (++repeats == 50u) {
             repeats = 0;
             step = (step + 1u) %
@@ -196,17 +200,16 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // Absolute 20 ms pacing avoids accumulating transfer/sleep drift.
+        // Absolute 20 ms pacing for nominal 50 Hz.
         add_period(&next);
 
         struct timespec current;
         clock_gettime(CLOCK_MONOTONIC, &current);
 
         if (time_is_later(current, next)) {
-            next = current; // Existing missed-deadline behavior.
+            next = current;
         }
 
-        // Dry-run generates packets without waiting or accessing SPI.
         if (!dry_run) {
             int rc;
 
@@ -225,6 +228,7 @@ int main(int argc, char **argv) {
                     "clock_nanosleep error=%d\n",
                     rc
                 );
+
                 close(fd);
                 return 1;
             }
