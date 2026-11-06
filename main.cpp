@@ -1,9 +1,9 @@
-
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdint>
-#include <cstring>
 #include <ctime>
+
 #include <fcntl.h>
 #include <linux/spi/spidev.h>
 #include <sys/ioctl.h>
@@ -11,233 +11,199 @@
 
 #include "spi_protocol.h"
 
-// Standalone Stage 1 mock commands.
-// The MCU receiver keeps motors and servo disabled.
+// 100 packets per 2-second phase at 50 Hz.
+constexpr int PACKETS_PER_PHASE = 100;
+constexpr int TOTAL_PACKETS = 400;
+
+static volatile sig_atomic_t stop_requested = 0;
+
+static void handle_stop(int) {
+    stop_requested = 1;
+}
+
 struct TestCommand {
-    int16_t speed;
-    int16_t steer;
-    uint8_t brake;
+    int16_t motor_effort;
+    int16_t steering_pulse_us;
+    uint8_t emergency_brake;
 };
 
-static constexpr TestCommand commands[] = {
-    {0,   0,    0}, // Stationary
-    {100, 0,    0}, // Forward
-    {100, 150,  0}, // Right steering
-    {100, -150, 0}, // Left steering
-    {0,   0,    1}, // Emergency brake
-    {0,   0,    0}  // Brake released
-};
+// Integer ramp with the beginning and end included.
+static int16_t ramp_value(int start, int end, int step) {
+    return static_cast<int16_t>(
+        start + (end - start) * step / (PACKETS_PER_PHASE - 1)
+    );
+}
 
-// Advance absolute deadline by one command period.
-static void add_period(struct timespec *t) {
-    t->tv_nsec += (long)SPI_CMD_PERIOD_US * 1000L;
+static TestCommand get_test_command(int packet_index) {
+    // 0-2s: steering left to right; motor remains stopped.
+    if (packet_index < 100) {
+        return {0, ramp_value(1750, 2250, packet_index), 0};
+    }
 
-    if (t->tv_nsec >= 1000000000L) {
-        ++t->tv_sec;
-        t->tv_nsec -= 1000000000L;
+    // 2-4s: steering right to left; motor remains stopped.
+    if (packet_index < 200) {
+        return {0, ramp_value(2250, 1750, packet_index - 100), 0};
+    }
+
+    // 4-6s: steering centered; motor effort ramps from 0 to 75.
+    if (packet_index < 300) {
+        return {ramp_value(0, 75, packet_index - 200),
+                SPI_TEST_STEERING_CENTER_US, 0};
+    }
+
+    // 6-8s: immediately set motor effort to zero.
+    return {0, SPI_TEST_STEERING_CENTER_US, 0};
+}
+
+// Send one 10-byte binary transaction with one CS assertion.
+static bool send_command(int fd, SpiCommand *cmd) {
+    if (!spi_command_test_ranges_ok(cmd)) {
+        std::fprintf(stderr, "Command out of range\n");
+        return false;
+    }
+
+    uint8_t tx[SPI_CMD_BYTES] = {};
+    uint8_t unused_rx[SPI_CMD_BYTES] = {};
+    spi_command_encode(cmd, tx);
+
+    spi_ioc_transfer transfer = {};
+    transfer.tx_buf = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tx));
+    transfer.rx_buf = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(unused_rx));
+    transfer.len = SPI_CMD_BYTES;
+    transfer.speed_hz = SPI_CMD_CLOCK_HZ;
+    transfer.bits_per_word = 8;
+    transfer.cs_change = 0;
+
+    const int result = ioctl(fd, SPI_IOC_MESSAGE(1), &transfer);
+    if (result < 0) {
+        std::perror("SPI transfer failed");
+        return false;
+    }
+    if (result != static_cast<int>(SPI_CMD_BYTES)) {
+        std::fprintf(stderr, "Incomplete SPI transfer: %d bytes\n", result);
+        return false;
+    }
+    return true;
+}
+
+// Schedule against CLOCK_MONOTONIC, not a relative usleep loop.
+static void add_period(timespec *time_point) {
+    time_point->tv_nsec += static_cast<long>(SPI_CMD_PERIOD_US) * 1000L;
+    if (time_point->tv_nsec >= 1000000000L) {
+        ++time_point->tv_sec;
+        time_point->tv_nsec -= 1000000000L;
     }
 }
 
-static bool time_is_later(
-    const struct timespec &a,
-    const struct timespec &b
-) {
-    return a.tv_sec > b.tv_sec ||
-           (a.tv_sec == b.tv_sec && a.tv_nsec > b.tv_nsec);
-}
-
-// Print encoded bytes for debugging.
-static void dump_hex(const uint8_t *data) {
-    for (unsigned i = 0; i < SPI_CMD_BYTES; ++i) {
-        std::printf(" %02X", (unsigned)data[i]);
+static bool wait_until(const timespec *next_time) {
+    while (!stop_requested) {
+        int result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+                                     next_time, nullptr);
+        if (result == 0) return true;
+        if (result != EINTR) {
+            errno = result;
+            std::perror("clock_nanosleep failed");
+            return false;
+        }
     }
-
-    std::putchar('\n');
+    return true;
 }
 
 int main(int argc, char **argv) {
     if (argc != 2) {
-        std::fprintf(
-            stderr,
-            "Usage: %s /dev/spidevB.C OR %s --dry-run\n",
-            argv[0],
-            argv[0]
-        );
+        std::printf("Usage: %s /dev/spidev0.0\n", argv[0]);
         return 1;
     }
 
-    const bool dry_run =
-        std::strcmp(argv[1], "--dry-run") == 0;
+    std::signal(SIGINT, handle_stop);
+    std::signal(SIGTERM, handle_stop);
 
-    int fd = -1;
-
-    if (!dry_run) {
-        // Open Jetson SPI device.
-        fd = open(argv[1], O_RDWR);
-
-        if (fd < 0) {
-            std::perror("open SPI");
-            return 1;
-        }
-
-        // SPI Mode 1: CPOL=0, CPHA=1.
-        // Match MCU settings.
-        uint8_t mode = SPI_MODE_1;
-        uint8_t bits = 8;
-        uint8_t lsb_first = 0;
-        uint32_t speed = SPI_CMD_CLOCK_HZ;
-
-        if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
-            ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
-            ioctl(fd, SPI_IOC_WR_LSB_FIRST, &lsb_first) < 0 ||
-            ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
-
-            std::perror("SPI setup");
-            close(fd);
-            return 1;
-        }
+    const int fd = open(argv[1], O_RDWR);
+    if (fd < 0) {
+        std::perror("Cannot open SPI");
+        return 1;
     }
 
-    std::puts(
-        dry_run
-            ? "[DRY RUN] generating binary packets only"
-            : "[TX READY] SPI mode 1, 100 kHz SCK, 10 bytes @ 50 Hz"
-    );
+    // Match RP2350 slave: SPI Mode 1, 8-bit words, MSB first.
+    uint8_t mode = SPI_MODE_1;
+    uint8_t bits = 8;
+    uint8_t lsb_first = 0;
+    uint32_t speed_hz = SPI_CMD_CLOCK_HZ;
+
+    if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
+        ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
+        ioctl(fd, SPI_IOC_WR_LSB_FIRST, &lsb_first) < 0 ||
+        ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed_hz) < 0) {
+        std::perror("Cannot configure SPI");
+        close(fd);
+        return 1;
+    }
+
+    std::printf("[TX READY] SPI mode 1, requested %u Hz, 10 bytes @ 50 Hz\n",
+                (unsigned)SPI_CMD_CLOCK_HZ);
+    std::puts("0-2s: steering 1750 -> 2250 us, motor 0");
+    std::puts("2-4s: steering 2250 -> 1750 us, motor 0");
+    std::puts("4-6s: steering 2000 us, motor 0 -> 75 effort");
+    std::puts("6-8s: steering 2000 us, motor 0 effort");
+    std::puts("Brake flag stays 0. Press Ctrl+C to stop.\n");
+
+    timespec next_time = {};
+    if (clock_gettime(CLOCK_MONOTONIC, &next_time) != 0) {
+        std::perror("clock_gettime failed");
+        close(fd);
+        return 1;
+    }
 
     uint16_t sequence = 0;
-    unsigned step = 0;
-    unsigned repeats = 0;
-    unsigned sent_count = 0;
+    bool success = true;
 
-    // Six commands, 50 packets each.
-    const unsigned max_dry_packets = 300;
-
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
-
-    while (true) {
-        const TestCommand v = commands[step];
-
+    for (int i = 0; i < TOTAL_PACKETS && !stop_requested; ++i) {
+        TestCommand test = get_test_command(i);
         SpiCommand cmd = {};
         cmd.sequence = sequence;
-        cmd.target_speed_mm_s = v.speed;
-        cmd.target_steering_mrad = v.steer;
-        cmd.emergency_brake = v.brake;
+        cmd.target_motor_effort = test.motor_effort;
+        cmd.target_steering_pulse_us = test.steering_pulse_us;
+        cmd.emergency_brake = test.emergency_brake;
 
-        // Encode fixed 10-byte binary packet.
-        uint8_t tx[SPI_CMD_BYTES];
-        spi_command_encode(&cmd, tx);
-
-        if (!dry_run) {
-            // SPI is full duplex, but MCU replies are
-            // not required for Stage 1.
-            uint8_t unused_rx[SPI_CMD_BYTES] = {};
-
-            // SPI MODE 1:
-            // One continuous 10-byte transfer.
-            // CS stays asserted during the packet.
-            spi_ioc_transfer transfer = {};
-
-            transfer.tx_buf =
-                (uint64_t)(uintptr_t)tx;
-
-            transfer.rx_buf =
-                (uint64_t)(uintptr_t)unused_rx;
-
-            transfer.len = SPI_CMD_BYTES;
-            transfer.speed_hz = SPI_CMD_CLOCK_HZ;
-            transfer.bits_per_word = 8;
-            transfer.cs_change = 0;
-
-            // Send all 10 bytes in one SPI transaction.
-            const int n = ioctl(
-                fd,
-                SPI_IOC_MESSAGE(1),
-                &transfer
-            );
-
-            if (n != (int)SPI_CMD_BYTES) {
-                std::fprintf(
-                    stderr,
-                    "SPI transfer failed: rc=%d errno=%d (%s)\n",
-                    n,
-                    errno,
-                    std::strerror(errno)
-                );
-
-                close(fd);
-                return 1;
-            }
+        if (!send_command(fd, &cmd)) {
+            success = false;
+            break;
         }
 
-        // Print representative packets.
-        if (repeats == 0 || (sequence % 50u) == 0u) {
-            std::printf(
-                "[TX] seq=%u speed_mm_s=%d steer_mrad=%d "
-                "brake=%u crc=%02X bytes:",
-                (unsigned)cmd.sequence,
-                (int)cmd.target_speed_mm_s,
-                (int)cmd.target_steering_mrad,
-                (unsigned)cmd.emergency_brake,
-                (unsigned)cmd.crc8
-            );
-
-            dump_hex(tx);
+        // Print once per second and on each ramp endpoint.
+        if (i % 50 == 0 || i == 99 || i == 199 || i == 299 || i == 399) {
+            std::printf("[TX] seq=%u time=%.2fs motor_effort=%d "
+                        "steering_us=%d brake=%u crc=%02X\n",
+                        (unsigned)cmd.sequence,
+                        i * 0.02,
+                        (int)cmd.target_motor_effort,
+                        (int)cmd.target_steering_pulse_us,
+                        (unsigned)cmd.emergency_brake,
+                        (unsigned)cmd.crc8);
             std::fflush(stdout);
         }
 
         ++sequence;
-        ++sent_count;
-
-        // Hold each command for 50 packets (~1 second).
-        if (++repeats == 50u) {
-            repeats = 0;
-            step = (step + 1u) %
-                   (sizeof(commands) / sizeof(commands[0]));
-        }
-
-        if (dry_run && sent_count == max_dry_packets) {
+        add_period(&next_time);
+        if (!wait_until(&next_time)) {
+            success = false;
             break;
         }
-
-        // Absolute 20 ms pacing for nominal 50 Hz.
-        add_period(&next);
-
-        struct timespec current;
-        clock_gettime(CLOCK_MONOTONIC, &current);
-
-        if (time_is_later(current, next)) {
-            next = current;
-        }
-
-        if (!dry_run) {
-            int rc;
-
-            do {
-                rc = clock_nanosleep(
-                    CLOCK_MONOTONIC,
-                    TIMER_ABSTIME,
-                    &next,
-                    nullptr
-                );
-            } while (rc == EINTR);
-
-            if (rc != 0) {
-                std::fprintf(
-                    stderr,
-                    "clock_nanosleep error=%d\n",
-                    rc
-                );
-
-                close(fd);
-                return 1;
-            }
-        }
     }
 
-    if (fd >= 0) {
-        close(fd);
+    // Best-effort final stop command, including when Ctrl+C was pressed.
+    // RP2350 must still have its own communication-timeout stop protection.
+    SpiCommand stop_cmd = {};
+    stop_cmd.sequence = sequence;
+    stop_cmd.target_motor_effort = 0;
+    stop_cmd.target_steering_pulse_us = SPI_TEST_STEERING_CENTER_US;
+    stop_cmd.emergency_brake = 0;
+
+    if (!send_command(fd, &stop_cmd)) {
+        success = false;
     }
 
-    return 0;
+    std::puts("[TX STOP] Motor effort=0, steering=2000 us");
+    close(fd);
+    return success ? 0 : 1;
 }
