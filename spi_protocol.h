@@ -12,10 +12,10 @@
 #define SPI_CMD_CLOCK_HZ    100000u // Requested SCK; Jetson measured ~150 kHz with clk_m
 
 // Bench-test command limits. Check servo endpoints and motor drive calibration.
-#define SPI_TEST_MOTOR_EFFORT_MAX    75
-#define SPI_TEST_STEERING_MIN_US     1750
-#define SPI_TEST_STEERING_MAX_US     2250
-#define SPI_TEST_STEERING_CENTER_US  2000
+#define SPI_TEST_MOTOR_EFFORT_MAX    100
+#define SPI_TEST_STEERING_MIN_US     1000
+#define SPI_TEST_STEERING_MAX_US     2000
+#define SPI_TEST_STEERING_CENTER_US  1500
 
 // Byte layout (10 bytes total):
 // [0..1] marker 5A A5, [2..3] sequence, [4..5] motor effort,
