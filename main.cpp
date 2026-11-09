@@ -17,9 +17,9 @@
 // ---------------------------------------------
 
 // Steering PWM (microseconds)
-constexpr int16_t STEER_LEFT = 1750;
-constexpr int16_t STEER_CENTER = 2000;
-constexpr int16_t STEER_RIGHT = 2250;
+constexpr int16_t STEER_LEFT = 1000;
+constexpr int16_t STEER_CENTER = 1500;
+constexpr int16_t STEER_RIGHT = 2000;
 
 // Motor effort
 constexpr int16_t MOTOR_RUN = 75;
@@ -68,7 +68,7 @@ constexpr TestStep test_steps[] = {
     {0, STEER_LEFT, MOTOR_RUN, BRAKE_OFF},
 
     // 3-6s: Center steering, stop motor
-    {3, STEER_CENTER, MOTOR_STOP, BRAKE_OFF},
+    {3, STEER_CENTER, MOTOR_RUN, BRAKE_OFF},
 
     // 6-9s: Drive while steering right
     {6, STEER_RIGHT, MOTOR_RUN, BRAKE_OFF},
